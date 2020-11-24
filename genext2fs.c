@@ -201,6 +201,7 @@ typedef signed short int16;
 typedef unsigned short uint16;
 typedef signed int int32;
 typedef unsigned int uint32;
+typedef unsigned long long uint64;
 
 // block size
 
@@ -694,6 +695,7 @@ struct hdlinks_s
 typedef struct
 {
 	FILE *f;
+	FILE *out_file;
 	superblock *sb;
 	int swapit;
 	int32 hdlink_cnt;
@@ -1377,21 +1379,19 @@ allocate(block b, uint32 item)
 	if(!item)
 	{
 		uint32 i;
-		uint8 bits;
-		for(i = 0; i < BLOCKSIZE; i++)
-			if((bits = b[i]) != (uint8)-1)
+		uint64 *bb = (uint64*) b;
+		uint64 bits;
+		for(i = 0; i < BLOCKSIZE / sizeof(uint64); i++)
+			if((bits = bb[i]) != (uint64)-1)
 			{
-				int j;
-				for(j = 0; j < 8; j++)
-					if(!(bits & (1 << j)))
-						break;
-				item = i * 8 + j + 1;
+				item = i * sizeof(uint64) * 8 + ffsl(~bits);
+				//printf("item=%u %lu %lu\n", item, bits, ~bits);
 				break;
 			}
-		if(i == BLOCKSIZE)
+		if(i == BLOCKSIZE / sizeof(uint64))
 			return 0;
 	}
-	b[(item-1) / 8] |= (1 << ((item-1) % 8));
+	b[(item-1) >> 3] |= (1 << ((item-1) & 0x7));
 	return item;
 }
 
@@ -1399,7 +1399,7 @@ allocate(block b, uint32 item)
 static void
 deallocate(block b, uint32 item)
 {
-	b[(item-1) / 8] &= ~(1 << ((item-1) % 8));
+	b[(item-1) >> 3] &= ~(1 << ((item-1) & 0x7));
 }
 
 // allocate a block
@@ -2098,7 +2098,7 @@ fs_upgrade_rev1_largefile(filesystem *fs)
 	fs->sb->s_inode_size = EXT2_GOOD_OLD_INODE_SIZE;
 }
 
-#define COPY_BLOCKS 16
+#define COPY_BLOCKS 8192
 #define CB_SIZE (COPY_BLOCKS * BLOCKSIZE)
 
 typedef off_t (*file_read_cb)(filesystem *fs, inode_pos *ipos, off_t size, void *data);
@@ -2982,8 +2982,10 @@ alloc_fs(int swapit, char *fname, uint32 nbblocks, FILE *srcfile)
 			if (fs->f)
 				copy_file(fs, fs->f, srcfile, nbblocks);
 		}
-	} else
-		fs->f = fopen(fname, "w+b");
+	} else {
+		fs->out_file = fopen(fname, "w+b");
+		fs->f = fmemopen(NULL, nbblocks * BLOCKSIZE, "w+b");
+	}
 	if (!fs->f)
 		perror_msg_and_die("opening %s", fname);
 	return fs;
@@ -2993,7 +2995,11 @@ alloc_fs(int swapit, char *fname, uint32 nbblocks, FILE *srcfile)
 static void
 set_file_size(filesystem *fs)
 {
-	if (ftruncate(fileno(fs->f),
+	FILE *f = fs->f;
+	if (fs->out_file)
+		f = fs->out_file;
+
+	if (ftruncate(fileno(f),
 		      ((off_t) fs->sb->s_blocks_count) * BLOCKSIZE))
 		perror_msg_and_die("set_file_size: ftruncate");
 }
@@ -3240,8 +3246,26 @@ load_fs(FILE *fh, int swapit, char *fname)
 static void
 free_fs(filesystem *fs)
 {
+	if (fs->out_file) {
+		rewind(fs->f);
+		rewind(fs->out_file);
+		const size_t bufsize = 2 * 1014 * 1024;
+		char *buf = malloc(bufsize);
+		size_t read_size;
+		do {
+			read_size = fread(buf, 1, bufsize, fs->f);
+			(void) fwrite(buf, 1, read_size, fs->out_file);
+		} while(read_size > 0 && 
+				  !feof(fs->f) &&
+				  !feof(fs->out_file) &&
+				  !ferror(fs->f) &&
+				  !ferror(fs->out_file));
+		free(buf);
+	}
+
 	free(fs->hdlinks.hdl);
 	fclose(fs->f);
+	fclose(fs->out_file);
 	free(fs->sb);
 	free(fs);
 }
@@ -3906,10 +3930,11 @@ main(int argc, char **argv)
 			     fs_timestamp, creator_os, bigendian, fsout);
 		fs_upgrade_rev1_largefile(fs);
 	}
+
 	if (volumelabel != NULL)
 		strncpy((char *)fs->sb->s_volume_name, volumelabel,
 			sizeof(fs->sb->s_volume_name));
-	
+
 	populate_fs(fs, layers, nlayers, squash_uids, squash_perms, fs_timestamp, NULL);
 
 	if(emptyval) {
@@ -3927,6 +3952,7 @@ main(int argc, char **argv)
 			GRP_PUT_BLOCK_BITMAP(bi,gi);
 		}
 	}
+
 	if(verbose)
 		print_fs(fs);
 	for(i = 0; i < gidx; i++)
@@ -3947,6 +3973,7 @@ main(int argc, char **argv)
 		flist_blocks(fs, nod, fh);
 		fclose(fh);
 	}
+
 	finish_fs(fs);
 	if(strcmp(fsout, "-") == 0)
 		copy_file(fs, stdout, fs->f, fs->sb->s_blocks_count);
